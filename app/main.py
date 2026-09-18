@@ -1,4 +1,4 @@
-"""JSON three-way merge service.
+"""JSON three-way merge and JSON Patch service.
 
 POST /merge accepts {"base": ..., "left": ..., "right": ...} and merges the
 changes that left and right each made relative to base:
@@ -10,6 +10,12 @@ changes that left and right each made relative to base:
 * conflicting changes (same path, different values, or one side deleting a
   subtree the other side modified) produce a 409 response listing every
   conflict, sorted by JSON Pointer (RFC 6901).
+
+POST /patch accepts {"document": ..., "operations": [...]} and applies an
+RFC 6902 JSON Patch (add / remove / replace / test) atomically: either every
+operation succeeds and the patched document is returned, or one fails and a
+409 identifies the failing operation. Malformed operations or JSON Pointers
+are rejected with 422.
 """
 
 from __future__ import annotations
@@ -20,46 +26,15 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.jsonutil import MISSING, escape_pointer, json_equal
+from app.patch import (
+    InvalidOperationError,
+    PatchConflictError,
+    apply_patch,
+    parse_operation,
+)
+
 app = FastAPI(title="JSON Three-Way Merge", version="1.0.0")
-
-
-class _Missing:
-    """Sentinel for an absent key, kept distinct from a JSON null value."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "MISSING"
-
-
-MISSING = _Missing()
-
-
-def json_equal(a: Any, b: Any) -> bool:
-    """Structural JSON equality.
-
-    Unlike plain ``==`` this keeps the JSON types distinct that Python folds
-    together (``True`` is not ``1``), while still treating ``1`` and ``1.0``
-    as the same JSON number.
-    """
-    if a is MISSING or b is MISSING:
-        return a is b
-    if isinstance(a, bool) or isinstance(b, bool):
-        return isinstance(a, bool) and isinstance(b, bool) and a == b
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return a == b
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        return a.keys() == b.keys() and all(json_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list):
-        return len(a) == len(b) and all(json_equal(x, y) for x, y in zip(a, b))
-    return a == b
-
-
-def escape_pointer(token: str) -> str:
-    """Escape one reference token as per RFC 6901."""
-    return token.replace("~", "~0").replace("/", "~1")
 
 
 def merge3(base: Any, left: Any, right: Any, path: str, conflicts: list) -> Any:
@@ -142,6 +117,35 @@ def merge_endpoint(request: MergeRequest):
             },
         )
     return {"merged": merged}
+
+
+class PatchRequest(BaseModel):
+    document: Any = Field(...)
+    operations: list[Any] = Field(...)
+
+
+@app.post("/patch")
+def patch_endpoint(request: PatchRequest):
+    try:
+        operations = [
+            parse_operation(raw, index)
+            for index, raw in enumerate(request.operations)
+        ]
+    except InvalidOperationError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+    try:
+        patched = apply_patch(request.document, operations)
+    except PatchConflictError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "patch failed",
+                "failed_index": exc.index,
+                "path": exc.path,
+                "reason": exc.reason,
+            },
+        )
+    return {"document": patched}
 
 
 @app.get("/health")

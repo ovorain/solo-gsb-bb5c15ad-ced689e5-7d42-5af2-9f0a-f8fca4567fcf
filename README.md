@@ -1,8 +1,12 @@
 # JSON Three-Way Merge Service
 
-一个基于 FastAPI 的 JSON 三方合并服务。`POST /merge` 接收 `base`、`left`、`right`
-三个 JSON 文档，将 left 和 right 各自相对 base 的修改合并后返回；存在冲突时返回
-`409` 并按 JSON Pointer 列出全部冲突。
+一个基于 FastAPI 的 JSON 三方合并与 JSON Patch 服务：
+
+- `POST /merge` 接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
+  各自相对 base 的修改合并后返回；存在冲突时返回 `409` 并按 JSON Pointer 列出
+  全部冲突。
+- `POST /patch` 接收 `document` 与 `operations`，按 RFC 6902 在深拷贝上原子地
+  依次执行 `add` / `remove` / `replace` / `test`，全部成功才返回结果。
 
 ## 快速开始
 
@@ -70,6 +74,58 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 键不存在时 `present: false`（`value` 固定为 `null`）；键存在且值为 JSON `null`
 时 `present: true, value: null`。
 
+### `POST /patch`
+
+按 RFC 6902 对 `document` 应用一组补丁操作。请求体：
+
+```json
+{
+  "document": { "a": [1, 2], "b": { "c/d": 1 } },
+  "operations": [
+    { "op": "add",     "path": "/a/-",    "value": 3 },
+    { "op": "test",    "path": "/b/c~1d", "value": 1 },
+    { "op": "replace", "path": "/b",      "value": null }
+  ]
+}
+```
+
+**全部成功 → `200`**，返回最终文档：
+
+```json
+{ "document": { "a": [1, 2, 3], "b": null } }
+```
+
+**操作失败 → `409`**，返回失败操作的信息，且不返回任何部分结果：
+
+```json
+{
+  "detail": "patch failed",
+  "failed_index": 1,
+  "path": "/a/9",
+  "reason": "array index 9 out of bounds (length 3)"
+}
+```
+
+**请求结构非法 → `422`**：操作不是对象、`op` 未知或缺失、`path` 缺失或不是
+合法的 JSON Pointer（如未以 `/` 开头、`~` 后未跟 `0`/`1`）、`add`/`replace`/
+`test` 缺少 `value`、`remove` 携带了 `value`，以及 `document`/`operations`
+字段缺失等。
+
+补丁规则：
+
+1. **原子性**：操作按数组顺序在深拷贝上依次执行；任一操作失败则整体失败，
+   原 `document` 不受影响，响应中不含部分结果。
+2. **JSON Pointer**（RFC 6901）：`~0` 表示 `~`，`~1` 表示 `/`；空字符串 `""`
+   指向整个文档（根路径）。
+3. **`add`**：对象键不存在则新增、存在则替换；数组按索引插入，索引等于数组
+   长度或用 `-` 表示追加到末尾；不会自动创建中间路径。
+4. **`remove` / `replace` / `test`**：目标必须已存在，且不得使用 `-`；否则
+   返回 `409`。
+5. **`test`**：用与 `/merge` 相同的 JSON 相等性规则比较（`1` 等于 `1.0`，
+   但 `true` 不等于 `1`），不相等返回 `409`。
+6. **`add` / `replace` / `test` 必须携带 `value`（`null` 也是合法值），
+   `remove` 禁止携带 `value`**，违反返回 `422`。
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -99,6 +155,18 @@ curl -s -X POST http://localhost:8000/merge \
   -H 'Content-Type: application/json' \
   -d '{"base":{"a":{"x":1}},"left":{},"right":{"a":{"x":2}}}'
 # => 409 {"detail":"merge conflict","conflicts":[{"path":"/a", ...}]}
+
+# 打补丁：数组追加 + 测试 + 替换
+curl -s -X POST http://localhost:8000/patch \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":[1,2]},"operations":[{"op":"add","path":"/a/-","value":3},{"op":"test","path":"/a/0","value":1}]}'
+# => {"document":{"a":[1,2,3]}}
+
+# 补丁失败：第二个操作越界，整体不生效
+curl -s -X POST http://localhost:8000/patch \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":[1]},"operations":[{"op":"add","path":"/a/-","value":2},{"op":"remove","path":"/a/9"}]}'
+# => 409 {"detail":"patch failed","failed_index":1,"path":"/a/9","reason":"array index 9 out of bounds (length 2)"}
 ```
 
 ## 测试
@@ -112,7 +180,10 @@ pytest
 
 ```
 app/main.py          # FastAPI 应用与三方合并算法
-tests/test_merge.py  # pytest 测试
+app/patch.py         # RFC 6902 JSON Patch（指针解析与原子执行）
+app/jsonutil.py      # 共享的 JSON 相等性与指针转义
+tests/test_merge.py  # /merge 的 pytest 测试
+tests/test_patch.py  # /patch 的 pytest 测试
 requirements.txt     # 运行依赖（Docker 构建时自动安装）
 requirements-dev.txt # 测试依赖
 Dockerfile
