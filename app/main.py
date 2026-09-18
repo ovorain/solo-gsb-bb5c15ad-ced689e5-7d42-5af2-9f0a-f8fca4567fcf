@@ -1,15 +1,21 @@
-"""JSON three-way merge service.
+"""JSON merge and patch service.
 
-POST /merge accepts {"base": ..., "left": ..., "right": ...} and merges the
-changes that left and right each made relative to base:
+* ``POST /merge`` accepts ``{"base": ..., "left": ..., "right": ...}`` and
+  merges the changes that left and right each made relative to base:
 
-* a change made on only one side is taken;
-* identical changes on both sides are taken;
-* objects are merged key by key, recursively;
-* arrays are compared as a whole (never merged element-wise);
-* conflicting changes (same path, different values, or one side deleting a
-  subtree the other side modified) produce a 409 response listing every
-  conflict, sorted by JSON Pointer (RFC 6901).
+  * a change made on only one side is taken;
+  * identical changes on both sides are taken;
+  * objects are merged key by key, recursively;
+  * arrays are compared as a whole (never merged element-wise);
+  * conflicting changes (same path, different values, or one side deleting a
+    subtree the other side modified) produce a 409 response listing every
+    conflict, sorted by JSON Pointer (RFC 6901).
+
+* ``POST /patch`` accepts ``{"document": ..., "operations": [...]}`` and
+  atomically applies RFC 6902 ``add`` / ``remove`` / ``replace`` / ``test``
+  operations to a deep copy of the document. Malformed requests yield 422;
+  unresolvable paths, out-of-bounds array indices and failed ``test``
+  operations yield 409 without any partial result.
 """
 
 from __future__ import annotations
@@ -20,41 +26,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="JSON Three-Way Merge", version="1.0.0")
+from .jsonutil import MISSING, json_equal
+from .patch import PatchConflict, PatchStructureError, apply_patch
 
-
-class _Missing:
-    """Sentinel for an absent key, kept distinct from a JSON null value."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "MISSING"
-
-
-MISSING = _Missing()
-
-
-def json_equal(a: Any, b: Any) -> bool:
-    """Structural JSON equality.
-
-    Unlike plain ``==`` this keeps the JSON types distinct that Python folds
-    together (``True`` is not ``1``), while still treating ``1`` and ``1.0``
-    as the same JSON number.
-    """
-    if a is MISSING or b is MISSING:
-        return a is b
-    if isinstance(a, bool) or isinstance(b, bool):
-        return isinstance(a, bool) and isinstance(b, bool) and a == b
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return a == b
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        return a.keys() == b.keys() and all(json_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list):
-        return len(a) == len(b) and all(json_equal(x, y) for x, y in zip(a, b))
-    return a == b
+app = FastAPI(title="JSON Merge & Patch Service", version="1.1.0")
 
 
 def escape_pointer(token: str) -> str:
@@ -142,6 +117,38 @@ def merge_endpoint(request: MergeRequest):
             },
         )
     return {"merged": merged}
+
+
+class PatchRequest(BaseModel):
+    document: Any = Field(...)
+    operations: list = Field(...)
+
+
+@app.post("/patch")
+def patch_endpoint(request: PatchRequest):
+    try:
+        document = apply_patch(request.document, request.operations)
+    except PatchConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "patch conflict",
+                "failed_index": exc.index,
+                "path": exc.path,
+                "reason": exc.reason,
+            },
+        )
+    except PatchStructureError as exc:
+        content: dict = {
+            "detail": "invalid patch operation",
+            "reason": exc.reason,
+        }
+        if exc.index >= 0:
+            content["failed_index"] = exc.index
+        if isinstance(exc.path, str):
+            content["path"] = exc.path
+        return JSONResponse(status_code=422, content=content)
+    return {"document": document}
 
 
 @app.get("/health")
